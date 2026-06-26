@@ -1,26 +1,27 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ИИ Сейчас — автопостер для Telegram-канала @ai_seychas (на Google Gemini, бесплатно).
+ИИ Сейчас — автопостер для Telegram-канала @ai_seychas (Google Gemini + картинка, бесплатно).
 
-Что делает за один запуск (конвейер из 4 этапов):
+Конвейер из 4 этапов за один запуск:
   1) СБОР     — тянет свежие новости про ИИ, агентов и нейросети из нескольких RSS-источников.
-  2) ОТБОР    — отсеивает уже опубликованное и старое, ранжирует, берёт топ-N.
-  3) НАПИСАНИЕ — пишет готовый пост в живом, доступном стиле (через Google Gemini API).
-  4) ФАКТЧЕК  — пишет строго по тексту источника, добавляет ссылку на оригинал,
-                не выдумывает фактов; числа/даты/названия берутся из источника.
+  2) ОТБОР    — отсеивает уже опубликованное и старое, ранжирует, берёт самое горячее (топ-N).
+  3) НАПИСАНИЕ — пишет цепляющий пост в живом стиле (Gemini) + генерирует промпт картинки и
+                 саму картинку по теме (Pollinations, бесплатно, без ключа).
+  4) ФАКТЧЕК/ОТПРАВКА — пишет строго по источнику (не выдумывает, даёт ссылку на оригинал),
+                 затем публикует пост ВМЕСТЕ с картинкой в канал.
 
-Запускается в облаке GitHub Actions 3 раза в день (см. .github/workflows/post.yml),
-поэтому работает даже когда твой компьютер выключен.
+Запускается в облаке GitHub Actions 3 раза в день — работает, даже когда комп выключен.
 
-Переменные окружения (задаются как Secrets/Variables в GitHub):
-  TELEGRAM_BOT_TOKEN   — токен бота от @BotFather (обязательно, Secret)
-  TELEGRAM_CHANNEL     — @ai_seychas или числовой chat_id канала (обязательно, Secret)
-  GEMINI_API_KEY       — ключ Google AI Studio (обязательно, Secret)
-  GEMINI_MODEL         — модель, по умолчанию gemini-2.0-flash
-  POSTS_PER_RUN        — сколько постов за запуск, по умолчанию 1
-  TIMEZONE_OFFSET      — смещение часов от UTC для подписи утро/день/вечер, по умолчанию 3 (МСК)
-  DRY_RUN              — "1" => ничего не отправлять, только напечатать (для теста)
+Переменные окружения (Secrets/Variables в GitHub):
+  TELEGRAM_BOT_TOKEN  — токен бота от @BotFather (Secret, обязательно)
+  TELEGRAM_CHANNEL    — @ai_seychas или chat_id (Secret, обязательно)
+  GEMINI_API_KEY      — ключ Google AI Studio (Secret, обязательно)
+  GEMINI_MODEL        — модель, по умолчанию gemini-2.5-flash
+  POSTS_PER_RUN       — постов за запуск, по умолчанию 1
+  TIMEZONE_OFFSET     — смещение часов от UTC (МСК = 3), по умолчанию 3
+  IMAGES_ENABLED      — "0" чтобы выключить картинки, по умолчанию включено
+  DRY_RUN             — "1" => не публиковать, только напечатать (тест)
 """
 
 import os
@@ -29,8 +30,9 @@ import sys
 import json
 import html
 import time
+import random
 import datetime as dt
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote
 
 import requests
 import feedparser
@@ -47,26 +49,26 @@ except Exception:
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 CHANNEL = os.environ.get("TELEGRAM_CHANNEL", "").strip()
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash").strip()
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash").strip()
 POSTS_PER_RUN = int(os.environ.get("POSTS_PER_RUN", "1"))
 TZ_OFFSET = int(os.environ.get("TIMEZONE_OFFSET", "3"))
+IMAGES_ENABLED = os.environ.get("IMAGES_ENABLED", "1").strip() not in ("0", "false", "False", "no")
 DRY_RUN = os.environ.get("DRY_RUN", "").strip() in ("1", "true", "True", "yes")
 
 STATE_FILE = "posted.json"
 FEEDS_FILE = "feeds.txt"
-MAX_AGE_HOURS = 36          # насколько старые новости ещё считаем «свежими»
-MAX_STATE = 800             # сколько последних ссылок храним, чтобы не повторяться
+MAX_AGE_HOURS = 36
+MAX_STATE = 800
+TG_CAPTION_LIMIT = 1024
 
-# RSS-источники по умолчанию (можно переопределить файлом feeds.txt — по одному URL в строке)
 DEFAULT_FEEDS = [
-    "https://news.google.com/rss/search?q=%22artificial%20intelligence%22%20OR%20%22AI%20model%22%20when:1d&hl=en-US&gl=US&ceid=US:en",
+    "https://news.google.com/rss/search?q=%22artificial%20intelligence%22%20OR%22AI%20model%22%20when:1d&hl=en-US&gl=US&ceid=US:en",
     "https://news.google.com/rss/search?q=%22AI%20agents%22%20OR%20LLM%20OR%20%22language%20model%22%20OR%20OpenAI%20OR%20Anthropic%20when:1d&hl=en-US&gl=US&ceid=US:en",
     "https://techcrunch.com/category/artificial-intelligence/feed/",
     "https://venturebeat.com/category/ai/feed/",
     "https://www.artificialintelligence-news.com/feed/",
 ]
 
-# «Горячие» термины — для приоритета при отборе
 HOT_TERMS = [
     "openai", "anthropic", "claude", "gpt", "gemini", "google", "deepmind",
     "llama", "meta", "mistral", "qwen", "deepseek", "release", "launch",
@@ -95,8 +97,7 @@ def load_state():
     if os.path.exists(STATE_FILE):
         try:
             with open(STATE_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                return set(data.get("posted", []))
+                return set(json.load(f).get("posted", []))
         except Exception:
             return set()
     return set()
@@ -147,24 +148,16 @@ def collect_candidates(feeds, seen):
         for entry in parsed.entries:
             link = entry.get("link", "").strip()
             title = clean_text(entry.get("title", ""))
-            if not link or not title:
+            if not link or not title or link in seen or link in items:
                 continue
-            if link in seen or link in items:
-                continue
-            ts = entry_time(entry)
-            if ts is None:
-                ts = now  # нет даты — считаем свежим
+            ts = entry_time(entry) or now
             age_h = (now - ts).total_seconds() / 3600.0
             if age_h > MAX_AGE_HOURS:
                 continue
             summary = clean_text(entry.get("summary", "") or entry.get("description", ""))
             items[link] = {
-                "title": title,
-                "link": link,
-                "summary": summary[:1200],
-                "ts": ts,
-                "age_h": age_h,
-                "source": source_name(link),
+                "title": title, "link": link, "summary": summary[:1200],
+                "ts": ts, "age_h": age_h, "source": source_name(link),
             }
     return list(items.values())
 
@@ -177,7 +170,6 @@ def score(item):
 
 
 def fetch_article_text(url):
-    """Пробуем достать текст статьи для большего контекста. Не критично — есть фолбэк."""
     try:
         r = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0 (compatible; AISeychasBot/1.0)"})
         if r.status_code != 200 or not r.text:
@@ -187,8 +179,7 @@ def fetch_article_text(url):
             for tag in soup(["script", "style", "nav", "header", "footer", "aside"]):
                 tag.extract()
             paras = [p.get_text(" ", strip=True) for p in soup.find_all("p")]
-            text = " ".join(p for p in paras if len(p) > 40)
-            return re.sub(r"\s+", " ", text).strip()[:4000]
+            return re.sub(r"\s+", " ", " ".join(p for p in paras if len(p) > 40)).strip()[:4000]
     except Exception as e:
         log(f"  не смог открыть статью: {e}")
     return ""
@@ -197,30 +188,57 @@ def fetch_article_text(url):
 def time_label():
     local_hour = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=TZ_OFFSET)).hour
     if 5 <= local_hour < 12:
-        return "утро (бодрый тон, что важного за ночь)"
+        return "утро — человек только проснулся, тон бодрый и заряжающий, кратко что важного"
     if 12 <= local_hour < 18:
-        return "день (деловой дайджест)"
-    return "вечер (спокойный разбор главного за день)"
+        return "день — деловой энергичный дайджест, по сути"
+    return "вечер — спокойный, но захватывающий разбор главного за день"
+
+
+def gemini_generate(system_prompt, user_msg, max_tokens=800, temperature=0.8):
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+    headers = {"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"}
+    payload = {
+        "contents": [{"role": "user", "parts": [{"text": user_msg}]}],
+        "generationConfig": {"temperature": temperature, "maxOutputTokens": max_tokens},
+    }
+    if system_prompt:
+        payload["system_instruction"] = {"parts": [{"text": system_prompt}]}
+    r = requests.post(url, headers=headers, json=payload, timeout=90)
+    if r.status_code != 200:
+        raise RuntimeError(f"Gemini API error {r.status_code}: {r.text[:300]}")
+    data = r.json()
+    try:
+        return data["candidates"][0]["content"]["parts"][0]["text"].strip()
+    except (KeyError, IndexError):
+        raise RuntimeError(f"Неожиданный ответ Gemini: {json.dumps(data)[:300]}")
 
 
 SYSTEM_PROMPT = (
     "Ты — редактор Telegram-канала «ИИ Сейчас» (@ai_seychas) про искусственный интеллект, "
     "нейросети и ИИ-агентов для широкой аудитории. Пишешь на русском.\n"
+    "ЦЕЛЬ: написать пост, который человек захочет прочитать ДО КОНЦА и захочет оставить комментарий.\n"
     "СТИЛЬ:\n"
+    "- Мощная первая строка-хук, которая цепляет с первой секунды.\n"
     "- Живой, доступный язык. Любой жаргон (инференс, дистилляция, токены, агент, бенчмарк) "
     "объясняй простыми словами прямо в тексте.\n"
-    "- Цепляющая первая строка-хук.\n"
-    "- Обращение к читателю на «ты».\n"
+    "- Обращение к читателю на «ты». Энергично, увлекательно, но без кликбейта-вранья.\n"
     "- Длина 500–900 знаков.\n"
     "- Эмодзи умеренно: 1–3 на пост.\n"
-    "- В конце — короткий вопрос или мысль для вовлечения и 2–3 хэштега.\n"
-    "- БЕЗ markdown-звёздочек и решёток-заголовков. Только чистый текст, эмодзи и переносы строк.\n"
+    "- В конце — цепляющий вопрос, который провоцирует комментарии, и 2–3 хэштега.\n"
+    "- БЕЗ markdown-звёздочек и решёток-заголовков. Только чистый текст, эмодзи, переносы строк.\n"
     "ФАКТЧЕК (строго):\n"
     "- Пиши ТОЛЬКО по предоставленному тексту источника. Не добавляй фактов, которых там нет.\n"
-    "- Числа, даты, имена и названия бери точно как в источнике.\n"
-    "- Ничего не выдумывай. Если данных мало — напиши короче, без домыслов.\n"
-    "- Если что-то в источнике подано как слух/неофициально — сохрани эту оговорку.\n"
+    "- Числа, даты, имена и названия — точно как в источнике.\n"
+    "- Ничего не выдумывай. Если данных мало — короче, без домыслов.\n"
+    "- Если в источнике что-то подано как слух/неофициально — сохрани оговорку.\n"
     "Верни ТОЛЬКО текст поста, без пояснений."
+)
+
+IMG_SYSTEM = (
+    "You are an art director. Given a news item about AI, write ONE short English prompt "
+    "for an illustration image. Rules: purely visual description; modern, clean, eye-catching "
+    "digital editorial illustration / concept art about technology and AI; NO text, NO words, "
+    "NO logos, NO watermarks in the image; one sentence, max 40 words. Return ONLY the prompt."
 )
 
 
@@ -231,41 +249,70 @@ def write_post(item, article_text, tlabel):
         f"Заголовок новости: {item['title']}\n"
         f"Источник: {item['source']}\n"
         f"Текст источника (опирайся только на него):\n{context}\n\n"
-        f"Напиши пост для канала по правилам из системного сообщения."
+        f"Напиши пост по правилам системного сообщения."
     )
-    url = (
-        f"https://generativelanguage.googleapis.com/v1beta/models/"
-        f"{GEMINI_MODEL}:generateContent"
-    )
-    headers = {"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"}
-    payload = {
-        "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
-        "contents": [{"role": "user", "parts": [{"text": user_msg}]}],
-        "generationConfig": {"temperature": 0.7, "maxOutputTokens": 800},
-    }
-    r = requests.post(url, headers=headers, json=payload, timeout=90)
-    if r.status_code != 200:
-        raise RuntimeError(f"Gemini API error {r.status_code}: {r.text[:300]}")
-    data = r.json()
-    try:
-        text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
-    except (KeyError, IndexError):
-        raise RuntimeError(f"Неожиданный ответ Gemini: {json.dumps(data)[:300]}")
-    # на всякий случай убираем markdown-звёздочки, если модель их вставила
+    text = gemini_generate(SYSTEM_PROMPT, user_msg, max_tokens=800, temperature=0.8)
     return text.replace("**", "").replace("__", "")
 
 
-def send_telegram(text):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+def make_image_url(item, post_text):
+    """Генерируем промпт картинки через Gemini и собираем ссылку на бесплатный генератор Pollinations."""
+    try:
+        prompt = gemini_generate(
+            IMG_SYSTEM,
+            f"News title: {item['title']}\nTopic context: {item['summary'][:600]}\n"
+            f"Write the illustration prompt.",
+            max_tokens=120, temperature=0.7,
+        )
+    except Exception as e:
+        log(f"  не смог сгенерировать промпт картинки: {e}")
+        prompt = "modern minimalist digital illustration about artificial intelligence and neural networks, glowing circuits, abstract tech concept art"
+    prompt = prompt.replace("\n", " ").strip().strip('"')[:300]
+    seed = random.randint(1, 1_000_000)
+    url = (
+        "https://image.pollinations.ai/prompt/"
+        + quote(prompt)
+        + f"?width=1280&height=720&nologo=true&model=flux&seed={seed}"
+    )
+    log(f"  промпт картинки: {prompt}")
+    return url
+
+
+def tg_send_photo(photo_url, caption):
     r = requests.post(
-        url,
+        f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto",
+        json={"chat_id": CHANNEL, "photo": photo_url, "caption": caption[:TG_CAPTION_LIMIT]},
+        timeout=60,
+    )
+    data = r.json()
+    if not data.get("ok"):
+        raise RuntimeError(f"Telegram sendPhoto error: {data}")
+    return data
+
+
+def tg_send_message(text):
+    r = requests.post(
+        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
         json={"chat_id": CHANNEL, "text": text[:4096], "disable_web_page_preview": False},
         timeout=30,
     )
     data = r.json()
     if not data.get("ok"):
-        raise RuntimeError(f"Telegram error: {data}")
+        raise RuntimeError(f"Telegram sendMessage error: {data}")
     return data
+
+
+def publish(post_full, image_url):
+    """Пытаемся отправить пост вместе с картинкой. Если не вышло — отправляем текстом, чтобы не терять пост."""
+    if image_url:
+        try:
+            tg_send_photo(image_url, post_full)
+            log("Отправлено в Telegram с картинкой ✅")
+            return
+        except Exception as e:
+            log(f"  не удалось отправить с картинкой, шлю текстом: {e}")
+    tg_send_message(post_full)
+    log("Отправлено в Telegram (текст) ✅")
 
 
 def main():
@@ -299,13 +346,14 @@ def main():
             article = fetch_article_text(item["link"])
             post = write_post(item, article, tlabel)
             post_full = f"{post}\n\nИсточник: {item['link']}"
+            image_url = make_image_url(item, post) if IMAGES_ENABLED else None
             log("----- ПОСТ -----")
             log(post_full)
+            log(f"----- КАРТИНКА -----\n{image_url}")
             if DRY_RUN:
                 log("(DRY_RUN: не отправляю)")
             else:
-                send_telegram(post_full)
-                log("Отправлено в Telegram ✅")
+                publish(post_full, image_url)
             seen.add(item["link"])
             posted_now += 1
             time.sleep(2)
