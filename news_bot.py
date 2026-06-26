@@ -2,26 +2,6 @@
 # -*- coding: utf-8 -*-
 """
 ИИ Сейчас — автопостер для Telegram-канала @ai_seychas (Google Gemini + картинка, бесплатно).
-
-Конвейер из 4 этапов за один запуск:
-  1) СБОР     — тянет свежие новости про ИИ, агентов и нейросети из нескольких RSS-источников.
-  2) ОТБОР    — отсеивает уже опубликованное и старое, ранжирует, берёт самое горячее (топ-N).
-  3) НАПИСАНИЕ — пишет цепляющий пост в живом стиле (Gemini) + генерирует промпт картинки и
-                 саму картинку по теме (Pollinations, бесплатно, без ключа).
-  4) ФАКТЧЕК/ОТПРАВКА — пишет строго по источнику (не выдумывает), проверяет, что пост не
-                 бракованный, затем публикует пост ВМЕСТЕ с картинкой.
-
-Запускается в облаке GitHub Actions 3 раза в день — работает, даже когда комп выключен.
-
-Переменные окружения (Secrets/Variables в GitHub):
-  TELEGRAM_BOT_TOKEN  — токен бота от @BotFather (Secret, обязательно)
-  TELEGRAM_CHANNEL    — @ai_seychas или chat_id (Secret, обязательно)
-  GEMINI_API_KEY      — ключ Google AI Studio (Secret, обязательно)
-  GEMINI_MODEL        — модель, по умолчанию gemini-2.5-flash
-  POSTS_PER_RUN       — постов за запуск, по умолчанию 1
-  TIMEZONE_OFFSET     — смещение часов от UTC (МСК = 3), по умолчанию 3
-  IMAGES_ENABLED      — "0" чтобы выключить картинки, по умолчанию включено
-  DRY_RUN             — "1" => не публиковать, только напечатать (тест)
 """
 
 import os
@@ -43,9 +23,6 @@ try:
 except Exception:
     HAVE_BS4 = False
 
-# ---------------------------------------------------------------------------
-# Конфиг
-# ---------------------------------------------------------------------------
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 CHANNEL = os.environ.get("TELEGRAM_CHANNEL", "").strip()
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
@@ -63,7 +40,7 @@ TG_CAPTION_LIMIT = 1024
 
 DEFAULT_FEEDS = [
     "https://news.google.com/rss/search?q=%22artificial%20intelligence%22%20OR%20%22AI%20model%22%20when:1d&hl=en-US&gl=US&ceid=US:en",
-    "https://news.google.com/rss/search?q=%22AI%20agents%22%20OR%20LLM%20OR%20%22language%20model%22%20OR%20OpenAI%20OR%20Anthropic%20when:1d&hl=en-US&gl=US&ceid=US:en",
+    "https://news.google.com/rss/search?q=%22AI%20agents%22%20OR%20LLM%20OR%20OpenAI%20OR%20Anthropic%20when:1d&hl=en-US&gl=US&ceid=US:en",
     "https://techcrunch.com/category/artificial-intelligence/feed/",
     "https://venturebeat.com/category/ai/feed/",
     "https://www.artificialintelligence-news.com/feed/",
@@ -74,6 +51,18 @@ HOT_TERMS = [
     "llama", "meta", "mistral", "qwen", "deepseek", "release", "launch",
     "agent", "model", "nvidia", "reasoning", "benchmark", "microsoft", "xai", "grok",
 ]
+
+POLITICAL_TERMS = [
+    "trump", "biden", "harris", "election", "president", "senate", "congress",
+    "white house", "putin", "zelensky", "ukraine", " war ", "warfare", "sanction",
+    "republican", "democrat", "parliament", "minister", "kremlin", "geopolit",
+    "immigration", "protest", "political", "politician", "campaign trail",
+]
+
+
+def is_political(item):
+    text = (item["title"] + " " + item["summary"]).lower()
+    return any(t in text for t in POLITICAL_TERMS)
 
 
 def log(msg):
@@ -221,30 +210,25 @@ SYSTEM_PROMPT = (
     "Ты — редактор Telegram-канала «ИИ Сейчас» (@ai_seychas) про искусственный интеллект, "
     "нейросети и ИИ-агентов для широкой аудитории. Пишешь на русском.\n"
     "ОЧЕНЬ ВАЖНО: твой ответ — это ИСКЛЮЧИТЕЛЬНО готовый текст поста на РУССКОМ языке. "
-    "Запрещено писать какие-либо комментарии, пояснения, рассуждения, редакторские правки, "
-    "оценки фраз, советы и любой текст на английском. Никаких «here is», «is better», "
-    "кавычек-цитат с разбором. Просто сразу выдай сам пост и больше ничего.\n"
+    "Запрещены любые комментарии, пояснения, рассуждения, редакторские правки и любой текст "
+    "на английском. Никаких «here is», «is better». Сразу выдай сам пост и больше ничего.\n"
     "ЦЕЛЬ: пост, который человек захочет прочитать ДО КОНЦА и оставить комментарий.\n"
+    "ПОДАЧА: пиши как новость — сначала суть (что произошло и у кого), потом почему это важно и "
+    "что меняется. НЕ оформляй как цитату, НЕ начинай с кавычек. Это новостной пост про технологии и гаджеты.\n"
     "СТИЛЬ:\n"
     "- Мощная первая строка-хук, которая цепляет с первой секунды.\n"
-    "- Живой, доступный язык. Любой жаргон (инференс, дистилляция, токены, агент, бенчмарк) "
-    "объясняй простыми словами прямо в тексте.\n"
-    "- Обращение к читателю на «ты». Энергично, увлекательно, но без кликбейта-вранья.\n"
-    "- Длина 500–900 знаков.\n"
-    "- Эмодзи умеренно: 1–3 на пост.\n"
-    "- В конце — цепляющий вопрос, который провоцирует комментарии.\n"
-    "- БЕЗ хэштегов. БЕЗ ссылок и слова «Источник». БЕЗ markdown-звёздочек и решёток. "
-    "Только чистый текст, эмодзи и переносы строк.\n"
-    "- НЕ банально: добавь конкретику и цифры, неожиданный угол или интригу, объясни, почему это важно "
-    "ЛИЧНО читателю. Избегай дежурных фраз («открывает новые горизонты», «меняет всё», «будущее уже здесь»). "
-    "Первая строка должна вызывать любопытство или удивление, а не просто пересказывать заголовок.\n"
-    "ФАКТЫ: опирайся только на текст источника, не выдумывай; числа, даты, имена — точно как в источнике; "
-    "если данных мало — пиши короче; слухи помечай как слухи."
+    "- Живой доступный язык; жаргон объясняй простыми словами.\n"
+    "- Обращение на «ты». Энергично, увлекательно, без кликбейта-вранья.\n"
+    "- Длина 500–900 знаков. Эмодзи 1–3.\n"
+    "- В конце — цепляющий вопрос для комментариев.\n"
+    "- БЕЗ хэштегов. БЕЗ ссылок и слова «Источник». БЕЗ markdown-звёздочек и решёток.\n"
+    "- НЕ банально: конкретика и цифры, неожиданный угол, почему это важно ЛИЧНО читателю. "
+    "Избегай дежурных фраз («открывает новые горизонты», «меняет всё»). Первая строка должна удивлять.\n"
+    "ФАКТЫ: только по тексту источника, не выдумывай; числа, даты, имена — точно как в источнике; слухи помечай."
 )
 
 
 def looks_broken(text):
-    """Грубая проверка, что модель выдала нормальный русский пост, а не комментарий/брак."""
     if len(text) < 180:
         return True
     latin = sum(1 for c in text if "a" <= c.lower() <= "z")
@@ -258,10 +242,12 @@ def looks_broken(text):
 
 
 IMG_SYSTEM = (
-    "You are an art director. Given a news item about AI, write ONE short English prompt "
-    "for an illustration image. Rules: purely visual description; modern, clean, eye-catching "
-    "digital editorial illustration / concept art about technology and AI; NO text, NO words, "
-    "NO logos, NO watermarks in the image; one sentence, max 40 words. Return ONLY the prompt."
+    "You are an art director for a tech news channel. Given a news item about AI, write ONE "
+    "vivid English prompt for a striking cover illustration that visually represents THIS "
+    "specific news (the product, company theme, robot, chip, gadget or concept involved). "
+    "Make it concrete and eye-catching, not a generic blue brain. Rules: purely visual; "
+    "modern cinematic digital editorial illustration / concept art; NO text, NO words, NO "
+    "letters, NO logos, NO watermarks, NO UI; one sentence, max 45 words. Return ONLY the prompt."
 )
 
 
@@ -280,29 +266,25 @@ def write_post(item, article_text, tlabel):
         text = text.replace("**", "").replace("__", "").strip()
         if not looks_broken(text):
             return text
-        log(f"  пост выглядит бракованным (попытка {attempt + 1}), пробую снова")
-    raise RuntimeError("Не удалось получить нормальный русский пост — пропускаю, чтобы не публиковать брак.")
+        log(f"  пост бракованный (попытка {attempt + 1}), пробую снова")
+    raise RuntimeError("Не удалось получить нормальный пост — пропускаю, чтобы не публиковать брак.")
 
 
 def make_image_url(item, post_text):
-    """Генерируем промпт картинки через Gemini и собираем ссылку на бесплатный генератор Pollinations."""
     try:
         prompt = gemini_generate(
             IMG_SYSTEM,
-            f"News title: {item['title']}\nTopic context: {item['summary'][:600]}\n"
-            f"Write the illustration prompt.",
+            f"News title: {item['title']}\nTopic context: {item['summary'][:600]}\nWrite the illustration prompt.",
             max_tokens=120, temperature=0.7,
         )
     except Exception as e:
         log(f"  не смог сгенерировать промпт картинки: {e}")
-        prompt = "modern minimalist digital illustration about artificial intelligence and neural networks, glowing circuits, abstract tech concept art"
-    prompt = prompt.replace("\n", " ").strip().strip('"')[:300]
+        prompt = "modern digital illustration about artificial intelligence and neural networks, glowing circuits, concept art"
+    prompt = prompt.replace("\n", " ").strip().strip('"')[:280]
+    prompt += ", highly detailed, cinematic lighting, vibrant colors, sharp focus, professional editorial illustration, 4k"
     seed = random.randint(1, 1_000_000)
-    url = (
-        "https://image.pollinations.ai/prompt/"
-        + quote(prompt)
-        + f"?width=1280&height=720&nologo=true&model=flux&seed={seed}"
-    )
+    url = ("https://image.pollinations.ai/prompt/" + quote(prompt)
+           + f"?width=1280&height=720&nologo=true&model=flux&seed={seed}")
     log(f"  промпт картинки: {prompt}")
     return url
 
@@ -332,7 +314,6 @@ def tg_send_message(text):
 
 
 def publish(post_full, image_url):
-    """Пытаемся отправить пост вместе с картинкой. Если не вышло — отправляем текстом, чтобы не терять пост."""
     if image_url:
         try:
             tg_send_photo(image_url, post_full)
@@ -369,9 +350,12 @@ def main():
     log(f"Время суток: {tlabel}. Нужно постов: {POSTS_PER_RUN}")
 
     posted_now = 0
-    for item in candidates[:8]:
+    for item in candidates[:10]:
         if posted_now >= POSTS_PER_RUN:
             break
+        if is_political(item):
+            log(f"Пропускаю политическую тему: {item['title'][:60]}")
+            continue
         try:
             article = fetch_article_text(item["link"])
             post = write_post(item, article, tlabel)
