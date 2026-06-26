@@ -1,0 +1,8 @@
+# RSS-источники новостей про ИИ. По одному URL в строке. Строки с # игнорируются.
+# Можешь добавлять/убирать источники — скрипт подхватит этот файл автоматически.
+
+https://news.google.com/rss/search?q=%22artificial%20intelligence%22%20OR%20%22AI%20model%22%20when:1d&hl=en-US&gl=US&ceid=US:en
+https://news.google.com/rss/search?q=%22AI%20agents%22%20OR%20LLM%20OR%20%22language%20model%22%20OR%20OpenAI%20OR%20Anthropic%20when:1d&hl=en-US&gl=US&ceid=US:en
+https://techcrunch.com/category/artificial-intelligence/feed/
+https://venturebeat.com/category/ai/feed/
+https://www.artificialintelligence-news.com/feed/
