@@ -9,7 +9,7 @@
   3) НАПИСАНИЕ — пишет цепляющий пост в живом стиле (Gemini) + генерирует промпт картинки и
                  саму картинку по теме (Pollinations, бесплатно, без ключа).
   4) ФАКТЧЕК/ОТПРАВКА — пишет строго по источнику (не выдумывает, даёт ссылку на оригинал),
-                 затем публикует пост ВМЕСТЕ с картинкой в канал.
+                 проверяет, что пост не бракованный, затем публикует пост ВМЕСТЕ с картинкой.
 
 Запускается в облаке GitHub Actions 3 раза в день — работает, даже когда комп выключен.
 
@@ -62,7 +62,7 @@ MAX_STATE = 800
 TG_CAPTION_LIMIT = 1024
 
 DEFAULT_FEEDS = [
-    "https://news.google.com/rss/search?q=%22artificial%20intelligence%22%20OR%22AI%20model%22%20when:1d&hl=en-US&gl=US&ceid=US:en",
+    "https://news.google.com/rss/search?q=%22artificial%20intelligence%22%20OR%20%22AI%20model%22%20when:1d&hl=en-US&gl=US&ceid=US:en",
     "https://news.google.com/rss/search?q=%22AI%20agents%22%20OR%20LLM%20OR%20%22language%20model%22%20OR%20OpenAI%20OR%20Anthropic%20when:1d&hl=en-US&gl=US&ceid=US:en",
     "https://techcrunch.com/category/artificial-intelligence/feed/",
     "https://venturebeat.com/category/ai/feed/",
@@ -216,7 +216,11 @@ def gemini_generate(system_prompt, user_msg, max_tokens=800, temperature=0.8):
 SYSTEM_PROMPT = (
     "Ты — редактор Telegram-канала «ИИ Сейчас» (@ai_seychas) про искусственный интеллект, "
     "нейросети и ИИ-агентов для широкой аудитории. Пишешь на русском.\n"
-    "ЦЕЛЬ: написать пост, который человек захочет прочитать ДО КОНЦА и захочет оставить комментарий.\n"
+    "ОЧЕНЬ ВАЖНО: твой ответ — это ИСКЛЮЧИТЕЛЬНО готовый текст поста на РУССКОМ языке. "
+    "Запрещено писать какие-либо комментарии, пояснения, рассуждения, редакторские правки, "
+    "оценки фраз, советы и любой текст на английском. Никаких «here is», «is better», "
+    "кавычек-цитат с разбором. Просто сразу выдай сам пост и больше ничего.\n"
+    "ЦЕЛЬ: пост, который человек захочет прочитать ДО КОНЦА и оставить комментарий.\n"
     "СТИЛЬ:\n"
     "- Мощная первая строка-хук, которая цепляет с первой секунды.\n"
     "- Живой, доступный язык. Любой жаргон (инференс, дистилляция, токены, агент, бенчмарк) "
@@ -226,13 +230,24 @@ SYSTEM_PROMPT = (
     "- Эмодзи умеренно: 1–3 на пост.\n"
     "- В конце — цепляющий вопрос, который провоцирует комментарии, и 2–3 хэштега.\n"
     "- БЕЗ markdown-звёздочек и решёток-заголовков. Только чистый текст, эмодзи, переносы строк.\n"
-    "ФАКТЧЕК (строго):\n"
-    "- Пиши ТОЛЬКО по предоставленному тексту источника. Не добавляй фактов, которых там нет.\n"
-    "- Числа, даты, имена и названия — точно как в источнике.\n"
-    "- Ничего не выдумывай. Если данных мало — короче, без домыслов.\n"
-    "- Если в источнике что-то подано как слух/неофициально — сохрани оговорку.\n"
-    "Верни ТОЛЬКО текст поста, без пояснений."
+    "ФАКТЫ: опирайся только на текст источника, не выдумывай; числа, даты, имена — точно как в источнике; "
+    "если данных мало — пиши короче; слухи помечай как слухи."
 )
+
+
+def looks_broken(text):
+    """Грубая проверка, что модель выдала нормальный русский пост, а не комментарий/брак."""
+    if len(text) < 180:
+        return True
+    latin = sum(1 for c in text if "a" <= c.lower() <= "z")
+    cyr = sum(1 for c in text if "а" <= c.lower() <= "я")
+    if cyr < 80 or latin > cyr:
+        return True
+    low = text.lower()
+    bad = ["is better", "in the source", "is a bit", "i would", "as an ai",
+           "here is", "here's", "sure,", "i cannot", "i can't"]
+    return any(b in low for b in bad)
+
 
 IMG_SYSTEM = (
     "You are an art director. Given a news item about AI, write ONE short English prompt "
@@ -251,8 +266,14 @@ def write_post(item, article_text, tlabel):
         f"Текст источника (опирайся только на него):\n{context}\n\n"
         f"Напиши пост по правилам системного сообщения."
     )
-    text = gemini_generate(SYSTEM_PROMPT, user_msg, max_tokens=800, temperature=0.8)
-    return text.replace("**", "").replace("__", "")
+    for attempt in range(2):
+        temp = 0.75 if attempt == 0 else 0.4
+        text = gemini_generate(SYSTEM_PROMPT, user_msg, max_tokens=800, temperature=temp)
+        text = text.replace("**", "").replace("__", "").strip()
+        if not looks_broken(text):
+            return text
+        log(f"  пост выглядит бракованным (попытка {attempt + 1}), пробую снова")
+    raise RuntimeError("Не удалось получить нормальный русский пост — пропускаю, чтобы не публиковать брак.")
 
 
 def make_image_url(item, post_text):
