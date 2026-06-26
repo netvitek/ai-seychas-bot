@@ -1,0 +1,59 @@
+name: ИИ Сейчас — автопостинг
+
+# Расписание в UTC. Стоит под Москву (UTC+3):
+#   09:00 МСК = 06:00 UTC   (утро)
+#   15:00 МСК = 12:00 UTC   (день)
+#   20:00 МСК = 17:00 UTC   (вечер)
+# Если у тебя другой часовой пояс — поменяй часы ниже и переменную TIMEZONE_OFFSET.
+on:
+  schedule:
+    - cron: '0 6 * * *'
+    - cron: '0 12 * * *'
+    - cron: '0 17 * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ai-seychas-post
+  cancel-in-progress: false
+
+jobs:
+  post:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install deps
+        run: pip install -r requirements.txt
+
+      - name: Run autoposter
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHANNEL: ${{ secrets.TELEGRAM_CHANNEL }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_MODEL: ${{ vars.GEMINI_MODEL || 'gemini-2.0-flash' }}
+          POSTS_PER_RUN: ${{ vars.POSTS_PER_RUN || '1' }}
+          TIMEZONE_OFFSET: ${{ vars.TIMEZONE_OFFSET || '3' }}
+          DRY_RUN: ${{ vars.DRY_RUN || '' }}
+        run: python news_bot.py
+
+      - name: Save state (posted.json)
+        if: always()
+        run: |
+          if [ -n "$(git status --porcelain posted.json)" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add posted.json
+            git commit -m "update posted state"
+            git push
+          else
+            echo "no changes in posted.json"
+          fi
