@@ -199,7 +199,11 @@ def gemini_generate(system_prompt, user_msg, max_tokens=800, temperature=0.8):
     headers = {"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"}
     payload = {
         "contents": [{"role": "user", "parts": [{"text": user_msg}]}],
-        "generationConfig": {"temperature": temperature, "maxOutputTokens": max_tokens},
+        "generationConfig": {
+            "temperature": temperature,
+            "maxOutputTokens": max_tokens,
+            "thinkingConfig": {"thinkingBudget": 0},
+        },
     }
     if system_prompt:
         payload["system_instruction"] = {"parts": [{"text": system_prompt}]}
@@ -357,12 +361,13 @@ def main():
         return
 
     candidates.sort(key=score, reverse=True)
-    chosen = candidates[:POSTS_PER_RUN]
     tlabel = time_label()
-    log(f"Время суток: {tlabel}. Готовлю постов: {len(chosen)}")
+    log(f"Время суток: {tlabel}. Нужно постов: {POSTS_PER_RUN}")
 
     posted_now = 0
-    for item in chosen:
+    for item in candidates[:8]:
+        if posted_now >= POSTS_PER_RUN:
+            break
         try:
             article = fetch_article_text(item["link"])
             post = write_post(item, article, tlabel)
@@ -379,7 +384,7 @@ def main():
             posted_now += 1
             time.sleep(2)
         except Exception as e:
-            log(f"Ошибка на посте «{item['title'][:60]}»: {e}")
+            log(f"Пропускаю «{item['title'][:60]}»: {e}")
 
     save_state(seen)
     log(f"Готово. Опубликовано в этот запуск: {posted_now}")
