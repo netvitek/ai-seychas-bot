@@ -1,15 +1,11 @@
 name: ИИ Сейчас — автопостинг
 
-# Расписание в UTC. Стоит под Москву (UTC+3):
-#   09:00 МСК = 06:00 UTC   (утро)
-#   15:00 МСК = 12:00 UTC   (день)
-#   20:00 МСК = 17:00 UTC   (вечер)
-# Если у тебя другой часовой пояс — поменяй часы ниже и переменную TIMEZONE_OFFSET.
+# Запуск каждые 30 минут (UTC 4-19 ≈ МСК 7-22). Скрипт сам постит РОВНО ОДИН раз
+# за каждое окно суток (утро/день/вечер) — надёжнее точного времени на бесплатном GitHub.
+# Ручной запуск (Run workflow) принудительно публикует пост сразу, минуя окна (FORCE=1).
 on:
   schedule:
-    - cron: '0 6 * * *'
-    - cron: '0 12 * * *'
-    - cron: '0 17 * * *'
+    - cron: '*/30 4-19 * * *'
   workflow_dispatch: {}
 
 permissions:
@@ -39,10 +35,12 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHANNEL: ${{ secrets.TELEGRAM_CHANNEL }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          GEMINI_MODEL: ${{ vars.GEMINI_MODEL || 'gemini-2.0-flash' }}
+          GEMINI_MODEL: ${{ vars.GEMINI_MODEL || 'gemini-2.5-flash' }}
           POSTS_PER_RUN: ${{ vars.POSTS_PER_RUN || '1' }}
           TIMEZONE_OFFSET: ${{ vars.TIMEZONE_OFFSET || '3' }}
+          IMAGES_ENABLED: ${{ vars.IMAGES_ENABLED || '1' }}
           DRY_RUN: ${{ vars.DRY_RUN || '' }}
+          FORCE: ${{ github.event_name == 'workflow_dispatch' && '1' || '' }}
         run: python news_bot.py
 
       - name: Save state (posted.json)
