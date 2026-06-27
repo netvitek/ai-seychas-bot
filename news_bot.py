@@ -1,18 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ИИ Сейчас — автопостер для Telegram-канала @ai_seychas.
-
-ЧЁТКАЯ СВЯЗКА ИЗ 4 АГЕНТОВ:
-  АГЕНТ 1 — СБОР:     собирает самые свежие новости про ИИ/агентов/нейросети из RSS (за 24 часа).
-  АГЕНТ 2 — ОТБОР:    выбирает САМУЮ горячую тему; отсекает политику, повторы и одну компанию подряд.
-  АГЕНТ 3 — АВТОР:    пишет цепляющий пост, затем по тезисам ЭТОГО поста строит промпт и
-                      генерирует ТЕМАТИЧЕСКУЮ картинку.
-  АГЕНТ 4 — КОНТРОЛЬ: проверяет, что пост не брак и что картинка подходит к посту
-                      (если нет — исправляет промпт). Если ок — публикует пост с картинкой.
-
-Картинку рисует бесплатный ИИ-генератор Pollinations.ai (Flux). Промпт пишет Gemini по тексту поста.
-Запускается в облаке GitHub Actions 3 раза в день.
+ИИ Сейчас — автопостер @ai_seychas. 4 агента + надёжное расписание по окнам.
+GitHub запускает воркфлоу каждые 30 минут, но пост выходит РОВНО ОДИН раз за окно
+(утро/день/вечер) — даже если GitHub опоздает. Картинку рисует Pollinations.ai (Flux).
 """
 
 import os
@@ -42,12 +33,19 @@ POSTS_PER_RUN = int(os.environ.get("POSTS_PER_RUN", "1"))
 TZ_OFFSET = int(os.environ.get("TIMEZONE_OFFSET", "3"))
 IMAGES_ENABLED = os.environ.get("IMAGES_ENABLED", "1").strip() not in ("0", "false", "False", "no")
 DRY_RUN = os.environ.get("DRY_RUN", "").strip() in ("1", "true", "True", "yes")
+FORCE = os.environ.get("FORCE", "").strip() in ("1", "true", "True", "yes")
 
 STATE_FILE = "posted.json"
 FEEDS_FILE = "feeds.txt"
 MAX_AGE_HOURS = 24
 MAX_STATE = 800
 TG_CAPTION_LIMIT = 1024
+
+WINDOWS = {
+    "morning": (7, 11, "утро — человек только проснулся, тон бодрый и заряжающий, кратко что важного"),
+    "day": (13, 16, "день — деловой энергичный дайджест, по сути"),
+    "evening": (18, 22, "вечер — спокойный, но захватывающий разбор главного за день"),
+}
 
 DEFAULT_FEEDS = [
     "https://news.google.com/rss/search?q=%22artificial%20intelligence%22%20OR%20%22AI%20model%22%20when:1d&hl=en-US&gl=US&ceid=US:en",
@@ -81,6 +79,18 @@ def log(msg):
     print(f"[ai-seychas] {msg}", flush=True)
 
 
+def local_now():
+    return dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=TZ_OFFSET)
+
+
+def current_window():
+    h = local_now().hour
+    for name, (start, end, _label) in WINDOWS.items():
+        if start <= h <= end:
+            return name
+    return None
+
+
 def is_political(item):
     text = (item["title"] + " " + item["summary"]).lower()
     return any(t in text for t in POLITICAL_TERMS)
@@ -112,17 +122,21 @@ def load_state():
         try:
             with open(STATE_FILE, "r", encoding="utf-8") as f:
                 d = json.load(f)
-                return set(d.get("posted", [])), list(d.get("recent_subjects", []))
+                return (set(d.get("posted", [])),
+                        list(d.get("recent_subjects", [])),
+                        list(d.get("done_windows", [])))
         except Exception:
-            return set(), []
-    return set(), []
+            return set(), [], []
+    return set(), [], []
 
 
-def save_state(posted_set, recent_subjects):
-    posted = list(posted_set)[-MAX_STATE:]
+def save_state(posted_set, recent_subjects, done_windows):
     with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump({"posted": posted, "recent_subjects": recent_subjects[-6:]},
-                  f, ensure_ascii=False, indent=2)
+        json.dump({
+            "posted": list(posted_set)[-MAX_STATE:],
+            "recent_subjects": recent_subjects[-6:],
+            "done_windows": done_windows[-12:],
+        }, f, ensure_ascii=False, indent=2)
 
 
 def entry_time(entry):
@@ -165,15 +179,6 @@ def fetch_article_text(url):
     except Exception as e:
         log(f"  не смог открыть статью: {e}")
     return ""
-
-
-def time_label():
-    local_hour = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=TZ_OFFSET)).hour
-    if 5 <= local_hour < 12:
-        return "утро — человек только проснулся, тон бодрый и заряжающий, кратко что важного"
-    if 12 <= local_hour < 18:
-        return "день — деловой энергичный дайджест, по сути"
-    return "вечер — спокойный, но захватывающий разбор главного за день"
 
 
 def gemini_generate(system_prompt, user_msg, max_tokens=800, temperature=0.8):
@@ -402,6 +407,7 @@ def agent4_check_and_publish(item, post, img_prompt, img_url):
     log("[Агент 4] опубликовано (текст) ✅")
 
 
+# ===================== ГЛАВНЫЙ КОНВЕЙЕР =====================
 def main():
     missing = [n for n, v in [
         ("TELEGRAM_BOT_TOKEN", BOT_TOKEN),
@@ -412,11 +418,24 @@ def main():
         log(f"НЕ заданы обязательные секреты: {', '.join(missing)}")
         sys.exit(1)
 
-    feeds = load_feeds()
-    seen, recent_subjects = load_state()
-    tlabel = time_label()
-    log(f"Время суток: {tlabel}. Нужно постов: {POSTS_PER_RUN}")
+    seen, recent_subjects, done_windows = load_state()
 
+    window = current_window()
+    today = local_now().strftime("%Y-%m-%d")
+    if FORCE and not window:
+        window = "manual"
+    if not window:
+        log(f"Сейчас {local_now().strftime('%H:%M')} — вне окна постинга. Выходим.")
+        return
+    wkey = f"{today}-{window}"
+    if not FORCE and wkey in done_windows:
+        log(f"В окно «{window}» ({today}) уже постили — выходим.")
+        return
+
+    tlabel = WINDOWS.get(window, (0, 0, "дайджест по ИИ"))[2]
+    log(f"Окно: {window} ({local_now().strftime('%H:%M')}). Нужно постов: {POSTS_PER_RUN}")
+
+    feeds = load_feeds()
     candidates = agent1_collect(feeds, seen)
     if not candidates:
         log("Нечего постить — свежих новостей не нашлось. Выходим без ошибки.")
@@ -444,7 +463,9 @@ def main():
         except Exception as e:
             log(f"Пропускаю «{item['title'][:60]}»: {e}")
 
-    save_state(seen, recent_subjects)
+    if posted_now > 0 and wkey not in done_windows:
+        done_windows.append(wkey)
+    save_state(seen, recent_subjects, done_windows)
     log(f"Готово. Опубликовано в этот запуск: {posted_now}")
 
 
