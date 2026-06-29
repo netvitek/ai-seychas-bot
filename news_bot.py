@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ИИ Сейчас — автопостер @ai_seychas. 4 агента + надёжное расписание по окнам.
-GitHub запускает воркфлоу каждые 30 минут, но пост выходит РОВНО ОДИН раз за окно
-(утро/день/вечер) — даже если GitHub опоздает. Картинку рисует Pollinations.ai (Flux).
+ИИ Сейчас — автопостер @ai_seychas. 4 агента + окна + жирный/эмодзи + vision-проверка картинки.
+GitHub запускает каждые 30 минут, пост выходит один раз за окно (утро/день/вечер).
 """
 
 import os
@@ -12,6 +11,7 @@ import sys
 import json
 import html
 import time
+import base64
 import random
 import datetime as dt
 from urllib.parse import urlparse, quote
@@ -42,9 +42,9 @@ MAX_STATE = 800
 TG_CAPTION_LIMIT = 1024
 
 WINDOWS = {
-    "morning": (7, 11, "утро — человек только проснулся, тон бодрый и заряжающий, кратко что важного"),
-    "day": (13, 16, "день — деловой энергичный дайджест, по сути"),
-    "evening": (18, 22, "вечер — спокойный, но захватывающий разбор главного за день"),
+    "morning": (8, 11, "утро — человек только проснулся, тон бодрый и заряжающий"),
+    "day": (14, 16, "день — деловой энергичный дайджест, по сути"),
+    "evening": (19, 21, "вечер — спокойный, но захватывающий разбор главного за день"),
 }
 
 DEFAULT_FEEDS = [
@@ -181,16 +181,17 @@ def fetch_article_text(url):
     return ""
 
 
-def gemini_generate(system_prompt, user_msg, max_tokens=800, temperature=0.8):
+def gemini_generate(system_prompt, user_msg, max_tokens=800, temperature=0.8, image_bytes=None):
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
     headers = {"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"}
+    parts = [{"text": user_msg}]
+    if image_bytes:
+        parts.append({"inline_data": {"mime_type": "image/jpeg",
+                                      "data": base64.b64encode(image_bytes).decode()}})
     payload = {
-        "contents": [{"role": "user", "parts": [{"text": user_msg}]}],
-        "generationConfig": {
-            "temperature": temperature,
-            "maxOutputTokens": max_tokens,
-            "thinkingConfig": {"thinkingBudget": 0},
-        },
+        "contents": [{"role": "user", "parts": parts}],
+        "generationConfig": {"temperature": temperature, "maxOutputTokens": max_tokens,
+                             "thinkingConfig": {"thinkingBudget": 0}},
     }
     if system_prompt:
         payload["system_instruction"] = {"parts": [{"text": system_prompt}]}
@@ -225,10 +226,8 @@ def agent1_collect(feeds, seen):
             if age_h > MAX_AGE_HOURS:
                 continue
             summary = clean_text(entry.get("summary", "") or entry.get("description", ""))
-            items[link] = {
-                "title": title, "link": link, "summary": summary[:1200],
-                "ts": ts, "age_h": age_h, "source": source_name(link),
-            }
+            items[link] = {"title": title, "link": link, "summary": summary[:1200],
+                           "ts": ts, "age_h": age_h, "source": source_name(link)}
     log(f"[Агент 1] собрано свежих новостей: {len(items)}")
     return list(items.values())
 
@@ -245,29 +244,26 @@ def agent2_select(candidates, recent_subjects):
     fresh = [it for it in candidates if not is_political(it)]
     fresh.sort(key=_score, reverse=True)
     fresh.sort(key=lambda it: 1 if (main_subject(it) and main_subject(it) in recent_subjects) else 0)
-    log(f"[Агент 2] кандидатов после отбора (без политики): {len(fresh)}")
+    log(f"[Агент 2] кандидатов после отбора: {len(fresh)}")
     return fresh
 
 
 # ===================== АГЕНТ 3 — АВТОР =====================
 POST_SYSTEM = (
-    "Ты — редактор Telegram-канала «ИИ Сейчас» (@ai_seychas) про искусственный интеллект, "
-    "нейросети и ИИ-агентов для широкой аудитории. Пишешь на русском.\n"
-    "ОЧЕНЬ ВАЖНО: твой ответ — это ИСКЛЮЧИТЕЛЬНО готовый текст поста на РУССКОМ языке. "
-    "Запрещены любые комментарии, пояснения, рассуждения, правки и любой текст на английском. "
-    "Никаких «here is», «is better». Сразу выдай сам пост и больше ничего.\n"
-    "ЦЕЛЬ: пост, который человек захочет прочитать ДО КОНЦА и оставить комментарий.\n"
-    "ПОДАЧА: пиши как новость — сначала суть (что произошло и у кого), потом почему это важно и "
-    "что меняется. НЕ оформляй как цитату, НЕ начинай с кавычек. Это новостной пост про технологии и гаджеты.\n"
-    "СТИЛЬ:\n"
-    "- Мощная первая строка-хук, которая удивляет и цепляет с первой секунды.\n"
-    "- Живой доступный язык; жаргон объясняй простыми словами.\n"
-    "- Обращение на «ты». Энергично, увлекательно, без кликбейта-вранья.\n"
-    "- Длина 500–900 знаков. Эмодзи 1–3.\n"
-    "- В конце — цепляющий вопрос для комментариев.\n"
-    "- БЕЗ хэштегов. БЕЗ ссылок и слова «Источник». БЕЗ markdown-звёздочек и решёток.\n"
-    "- НЕ банально: конкретика и цифры, неожиданный угол, почему это важно ЛИЧНО читателю.\n"
-    "ФАКТЫ: только по тексту источника, не выдумывай; числа, даты, имена — точно как в источнике; слухи помечай."
+    "Ты — редактор Telegram-канала «ИИ Сейчас» (@ai_seychas) про ИИ, нейросети и агентов "
+    "для широкой аудитории. Пишешь на русском.\n"
+    "ОТВЕТ — ТОЛЬКО готовый текст поста на русском, без комментариев и без английского.\n"
+    "ЦЕЛЬ: чтобы человек прочитал ДО КОНЦА и захотел оставить комментарий.\n"
+    "ФОРМАТ:\n"
+    "- Подача как новость: суть (что и у кого), потом почему это важно.\n"
+    "- Мощный хук в первой строке.\n"
+    "- ГЛАВНОЕ выделяй жирным, оборачивая в двойные звёздочки: **главная мысль**, "
+    "**названия**, **цифры**. Выдели так 2–4 ключевых места.\n"
+    "- Эмодзи активно: 4–7 штук, по смыслу, в начале абзацев и у ключевых мыслей.\n"
+    "- Обращение на «ты», энергично, без вранья. Жаргон объясняй простыми словами.\n"
+    "- Длина 500–900 знаков. В конце — цепляющий вопрос для комментариев.\n"
+    "- БЕЗ хэштегов, БЕЗ ссылок, БЕЗ слова «Источник», БЕЗ заголовков-решёток.\n"
+    "ФАКТЫ: только по источнику, не выдумывай; числа/имена точно как в источнике."
 )
 
 
@@ -279,46 +275,37 @@ def _looks_broken(text):
     if cyr < 80 or latin > cyr:
         return True
     low = text.lower()
-    bad = ["is better", "in the source", "is a bit", "i would", "as an ai",
-           "here is", "here's", "sure,", "i cannot", "i can't"]
+    bad = ["is better", "in the source", "is a bit", "i would", "as an ai", "here is", "i cannot"]
     return any(b in low for b in bad)
 
 
 def agent3_write_post(item, article_text, tlabel):
     context = article_text if len(article_text) > len(item["summary"]) else item["summary"]
-    user_msg = (
-        f"Время суток: {tlabel}\n"
-        f"Заголовок новости: {item['title']}\n"
-        f"Источник: {item['source']}\n"
-        f"Текст источника (опирайся только на него):\n{context}\n\n"
-        f"Напиши пост по правилам системного сообщения."
-    )
+    user_msg = (f"Время суток: {tlabel}\nЗаголовок: {item['title']}\nИсточник: {item['source']}\n"
+                f"Текст источника:\n{context}\n\nНапиши пост по правилам.")
     for attempt in range(2):
-        temp = 0.75 if attempt == 0 else 0.4
-        text = gemini_generate(POST_SYSTEM, user_msg, max_tokens=800, temperature=temp)
-        text = text.replace("**", "").replace("__", "").strip()
+        text = gemini_generate(POST_SYSTEM, user_msg, 800, 0.75 if attempt == 0 else 0.4)
+        text = text.replace("__", "").strip()
         if not _looks_broken(text):
             log("[Агент 3] пост готов")
             return text
-        log(f"  [Агент 3] пост бракованный (попытка {attempt + 1}), пробую снова")
-    raise RuntimeError("Не удалось получить нормальный пост — пропускаю, чтобы не публиковать брак.")
+        log(f"  [Агент 3] брак (попытка {attempt + 1}), пробую снова")
+    raise RuntimeError("Не удалось получить нормальный пост.")
 
 
 IMG_SYSTEM = (
-    "You are an art director for a tech news channel. Read the Russian news post and design ONE "
-    "cover image that LITERALLY shows the main subject of THIS exact news (the specific product, "
-    "robot, chip, device, app or company concept it talks about) as one clear central focus. "
-    "Avoid generic blue brains and random glowing circuits. Write ONE vivid English prompt: purely "
-    "visual, modern cinematic editorial illustration / concept art, one clear central subject, depth, "
-    "mood. NO text, NO words, NO letters, NO logos, NO watermarks, NO UI. One sentence, max 45 words. "
-    "Return ONLY the prompt."
+    "You are an art director. Read the Russian post and write ONE English image prompt for a cover "
+    "that LITERALLY depicts the concrete subject of THIS news as a clear cinematic photo-real scene: "
+    "the actual robot, gadget, phone, chip, device, datacenter, or people using the technology. "
+    "STRICTLY FORBIDDEN: brains, glowing blue brain, abstract neural-network nodes, circuit-board "
+    "patterns, generic 'AI' blobs, wireframe heads. Concrete real-world scene only. "
+    "NO text, NO words, NO letters, NO logos, NO watermarks. One sentence, max 45 words. Return ONLY the prompt."
 )
 
 
 def _build_image_url(prompt):
     prompt = prompt.replace("\n", " ").strip().strip('"')[:280]
-    prompt += (", highly detailed, cinematic lighting, vibrant colors, sharp focus, "
-               "professional editorial illustration, 4k")
+    prompt += ", cinematic photography, highly detailed, dramatic lighting, sharp focus, 4k"
     seed = random.randint(1, 1_000_000)
     return ("https://image.pollinations.ai/prompt/" + quote(prompt)
             + f"?width=1280&height=720&nologo=true&model=flux&seed={seed}")
@@ -326,100 +313,94 @@ def _build_image_url(prompt):
 
 def agent3_make_image(item, post):
     try:
-        prompt = gemini_generate(
-            IMG_SYSTEM,
-            f"News title: {item['title']}\n\nRussian post:\n{post[:900]}\n\n"
-            f"Write the cover illustration prompt for the MAIN subject of this news.",
-            max_tokens=120, temperature=0.7,
-        )
+        prompt = gemini_generate(IMG_SYSTEM,
+                                 f"Russian post:\n{post[:900]}\n\nWrite the cover image prompt.",
+                                 120, 0.7)
     except Exception as e:
-        log(f"  [Агент 3] не смог сгенерировать промпт картинки: {e}")
-        prompt = "modern cinematic digital illustration about a new AI technology product, clear central subject, concept art"
+        log(f"  [Агент 3] промпт картинки не вышел: {e}")
+        prompt = "a sleek modern robot using a laptop in a bright office, cinematic photography"
     prompt = prompt.replace("\n", " ").strip().strip('"')
     log(f"[Агент 3] промпт картинки: {prompt}")
     return prompt, _build_image_url(prompt)
 
 
-# ===================== АГЕНТ 4 — КОНТРОЛЬ + ОТПРАВКА =====================
-IMG_CHECK = (
-    "You verify that a cover image matches a news post. Given the Russian post and the English image "
-    "prompt, decide: if the image clearly illustrates the MAIN subject of the post, reply with exactly "
-    "OK. If it does NOT match, reply with a corrected ONE-sentence English image prompt (purely visual, "
-    "no text/logos/words) that fits the post's main subject. Reply ONLY 'OK' or the new prompt."
+# ===================== АГЕНТ 4 — КОНТРОЛЬ (vision) + ОТПРАВКА =====================
+VISION_CHECK = (
+    "You see a generated cover image and a Russian news post. If the image clearly matches the post's "
+    "main subject and is NOT a generic brain/abstract-AI picture, reply EXACTLY: OK. Otherwise reply "
+    "with ONE improved English image prompt (concrete real scene, no text/logos/brains). Reply ONLY "
+    "'OK' or the new prompt."
 )
 
 
-def _tg_send_photo(photo_url, caption):
-    r = requests.post(
-        f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto",
-        json={"chat_id": CHANNEL, "photo": photo_url, "caption": caption[:TG_CAPTION_LIMIT]},
-        timeout=60,
-    )
+def _to_html(text):
+    esc = html.escape(text)
+    return re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", esc, flags=re.S)
+
+
+def _tg(method, payload):
+    r = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/{method}", json=payload, timeout=60)
     data = r.json()
     if not data.get("ok"):
-        raise RuntimeError(f"Telegram sendPhoto error: {data}")
+        raise RuntimeError(f"Telegram {method} error: {data}")
     return data
 
 
-def _tg_send_message(text):
-    r = requests.post(
-        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-        json={"chat_id": CHANNEL, "text": text[:4096], "disable_web_page_preview": False},
-        timeout=30,
-    )
-    data = r.json()
-    if not data.get("ok"):
-        raise RuntimeError(f"Telegram sendMessage error: {data}")
-    return data
+def _publish(post, img_url):
+    html_post = _to_html(post)
+    plain = post.replace("**", "")
+    if img_url:
+        try:
+            _tg("sendPhoto", {"chat_id": CHANNEL, "photo": img_url,
+                              "caption": html_post[:TG_CAPTION_LIMIT], "parse_mode": "HTML"})
+            log("[Агент 4] опубликовано с картинкой ✅")
+            return
+        except Exception as e:
+            log(f"  [Агент 4] HTML/картинка не прошли ({e}), пробую проще")
+            try:
+                _tg("sendPhoto", {"chat_id": CHANNEL, "photo": img_url, "caption": plain[:TG_CAPTION_LIMIT]})
+                log("[Агент 4] опубликовано с картинкой (без разметки) ✅")
+                return
+            except Exception as e2:
+                log(f"  [Агент 4] картинка не ушла ({e2}), шлю текстом")
+    try:
+        _tg("sendMessage", {"chat_id": CHANNEL, "text": html_post[:4096], "parse_mode": "HTML"})
+    except Exception:
+        _tg("sendMessage", {"chat_id": CHANNEL, "text": plain[:4096]})
+    log("[Агент 4] опубликовано текстом ✅")
 
 
 def agent4_check_and_publish(item, post, img_prompt, img_url):
     if img_url and img_prompt:
         try:
-            verdict = gemini_generate(
-                IMG_CHECK,
-                f"Post (RU):\n{post[:900]}\n\nImage prompt (EN):\n{img_prompt}",
-                max_tokens=80, temperature=0.2,
-            ).strip()
+            img_bytes = requests.get(img_url, timeout=70).content
+            verdict = gemini_generate(VISION_CHECK, f"Пост:\n{post[:800]}", 80, 0.2,
+                                      image_bytes=img_bytes).strip()
             if verdict and not verdict.upper().startswith("OK") and len(verdict) > 15:
-                log(f"[Агент 4] картинка не в тему — переписываю промпт: {verdict}")
+                log(f"[Агент 4] картинка не подошла — перегенерирую: {verdict[:80]}")
                 img_url = _build_image_url(verdict)
             else:
-                log("[Агент 4] картинка подходит ✅")
+                log("[Агент 4] картинка проверена (vision) и подходит ✅")
         except Exception as e:
-            log(f"  [Агент 4] проверку картинки пропускаю: {e}")
-
+            log(f"  [Агент 4] vision-проверку пропускаю: {e}")
     log("----- ПОСТ -----")
     log(post)
     log(f"----- КАРТИНКА -----\n{img_url}")
     if DRY_RUN:
         log("(DRY_RUN: не отправляю)")
         return
-
-    if img_url:
-        try:
-            _tg_send_photo(img_url, post)
-            log("[Агент 4] опубликовано с картинкой ✅")
-            return
-        except Exception as e:
-            log(f"  [Агент 4] не вышло с картинкой, шлю текстом: {e}")
-    _tg_send_message(post)
-    log("[Агент 4] опубликовано (текст) ✅")
+    _publish(post, img_url)
 
 
 # ===================== ГЛАВНЫЙ КОНВЕЙЕР =====================
 def main():
-    missing = [n for n, v in [
-        ("TELEGRAM_BOT_TOKEN", BOT_TOKEN),
-        ("TELEGRAM_CHANNEL", CHANNEL),
-        ("GEMINI_API_KEY", GEMINI_API_KEY),
-    ] if not v]
+    missing = [n for n, v in [("TELEGRAM_BOT_TOKEN", BOT_TOKEN), ("TELEGRAM_CHANNEL", CHANNEL),
+                              ("GEMINI_API_KEY", GEMINI_API_KEY)] if not v]
     if missing:
-        log(f"НЕ заданы обязательные секреты: {', '.join(missing)}")
+        log(f"НЕ заданы секреты: {', '.join(missing)}")
         sys.exit(1)
 
     seen, recent_subjects, done_windows = load_state()
-
     window = current_window()
     today = local_now().strftime("%Y-%m-%d")
     if FORCE and not window:
@@ -435,12 +416,10 @@ def main():
     tlabel = WINDOWS.get(window, (0, 0, "дайджест по ИИ"))[2]
     log(f"Окно: {window} ({local_now().strftime('%H:%M')}). Нужно постов: {POSTS_PER_RUN}")
 
-    feeds = load_feeds()
-    candidates = agent1_collect(feeds, seen)
+    candidates = agent1_collect(load_feeds(), seen)
     if not candidates:
-        log("Нечего постить — свежих новостей не нашлось. Выходим без ошибки.")
+        log("Нечего постить — свежих новостей нет. Выходим.")
         return
-
     ordered = agent2_select(candidates, recent_subjects)
 
     posted_now = 0
@@ -466,7 +445,7 @@ def main():
     if posted_now > 0 and wkey not in done_windows:
         done_windows.append(wkey)
     save_state(seen, recent_subjects, done_windows)
-    log(f"Готово. Опубликовано в этот запуск: {posted_now}")
+    log(f"Готово. Опубликовано: {posted_now}")
 
 
 if __name__ == "__main__":
